@@ -1,0 +1,29 @@
+[project]
+name = "racer-rl"
+version = "0.1.0"
+description = "An RL assignment: train a policy to race a car around a track, built on HighwayEnv"
+readme = "README.md"
+authors = [
+    { name = "Deemo Chen", email = "deemo@caltech.edu" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "highway-env==1.12.1",
+    "imageio-ffmpeg>=0.8.1",
+    "ipykernel>=7.4.0",
+    "stable-baselines3>=2.9",
+    "tensorboard>=2.21.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+extend-exclude = ["*.ipynb"]  # notebooks import things for students to use later
