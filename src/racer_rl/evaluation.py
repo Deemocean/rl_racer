@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import imageio_ffmpeg
 import numpy as np
 
-from racer_rl.env import Step, make_env
+from racer_rl.env import DT, Step, make_env
 from racer_rl.rendering import format_time
 
 
@@ -56,10 +57,9 @@ class VideoRecorder:
 
     def __init__(self, env, path: Path) -> None:
         self.env, self.path = env, path
-        self.frames_per_sec = 30  # overwritten by the environment, see below
         self._encoder = None
-        # HighwayEnv then calls _capture_frame() for the frames between two decisions
-        env.unwrapped.set_record_video_wrapper(self)
+        # The environment then calls capture() for the frames between two decisions
+        env.unwrapped.recorder = self
 
     def capture(self) -> None:
         """Render and store the current frame."""
@@ -69,15 +69,16 @@ class VideoRecorder:
             self._encoder = imageio_ffmpeg.write_frames(
                 str(self.path),
                 (width, height),
-                fps=self.frames_per_sec,
+                fps=self.env.metadata["render_fps"],
                 quality=6,
                 macro_block_size=2,
                 output_params=["-preset", "veryfast"],
             )
-            self._encoder.send(None)
+            with warnings.catch_warnings():
+                # JAX warns about any fork, including the one that starts ffmpeg
+                warnings.simplefilter("ignore", RuntimeWarning)
+                self._encoder.send(None)
         self._encoder.send(frame)
-
-    _capture_frame = capture
 
     def close(self) -> None:
         if self._encoder is not None:
@@ -92,12 +93,15 @@ def time_trial(
     video: str | None = None,
     render: bool = False,
     save_trial: str | None = None,
+    with_state: bool = False,
     **config,
 ) -> TimeTrialResult:
     """
     Time a policy over a few laps, from a standing start on the start/finish line.
 
     :param policy: a function mapping an observation to an action
+    :param with_state: also give the policy the ``State`` of the race, as a second
+        argument: what a planner looks ahead from
     :param track: a name from ``racer_rl.track.TRACKS``
     :param laps: number of laps to complete
     :param video: a folder in which to save a video of the trial
@@ -110,9 +114,9 @@ def time_trial(
         wheels [rad]), ``lateral_speed`` [m/s] and ``yaw_rate`` [rad/s]. Also
         ``lap_times`` [s] of the laps that were completed, ``laps`` (how many were
         asked for), ``completed`` and ``off_track`` as in the result, ``track``,
-        ``dynamics`` and ``dt`` (the time between two decisions [s]).
-    :param config: other entries of the environment config, e.g. ``camera="follow"``
-        or ``dynamics="dynamic"``
+        ``dynamics`` (always "dynamic") and ``dt`` (the time between two decisions
+        [s]).
+    :param config: other arguments of the environment, e.g. ``camera="follow"``
     """
     env = make_env(
         track,
@@ -135,7 +139,8 @@ def time_trial(
     while not done:
         if recorder:
             recorder.capture()
-        action = np.clip(np.asarray(policy(obs), dtype=float), -1.0, 1.0)
+        action = policy(obs, env.unwrapped.state) if with_state else policy(obs)
+        action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         obs, _, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         actions.append(action)
@@ -143,11 +148,7 @@ def time_trial(
     track_length = env.unwrapped.track.length
     if recorder:
         recorder.close()
-    details = {
-        "track": track,
-        "dynamics": env.unwrapped.config["dynamics"],
-        "dt": 1 / env.unwrapped.config["policy_frequency"],
-    }
+    details = {"track": track, "dynamics": "dynamic", "dt": DT}
     env.close()
 
     completed = info["laps"] == laps
@@ -168,16 +169,8 @@ def time_trial(
 
 def _state(env) -> tuple:
     """The time and the state of the car: enough to carry on from there."""
-    car = env.unwrapped.vehicle
-    return (
-        env.unwrapped.time,
-        *car.position,
-        car.heading,
-        car.speed,
-        car.steering_angle,
-        getattr(car, "lateral_speed", 0.0),  # the kinematic car has none
-        car.yaw_rate,
-    )
+    x, y, heading, speed, lateral_speed, yaw_rate, wheels = env.unwrapped.car
+    return env.unwrapped.time, x, y, heading, speed, wheels, lateral_speed, yaw_rate
 
 
 def _save(
@@ -241,7 +234,7 @@ def rollout(
 
     Useful to check what a reward function makes of a given way of driving.
 
-    :param config: other entries of the environment config, e.g. ``dynamics="dynamic"``
+    :param config: other arguments of the environment
     :return: the sum of the rewards ("return"), the time driven [s] ("time"), the
         distance covered along the track [m] ("distance"), and whether the car left
         the track ("off_track")

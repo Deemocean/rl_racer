@@ -1,11 +1,22 @@
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env
 
-from racer_rl import TRACKS, RaceCar, Step, Track, make_env, show_video, time_trial
-from racer_rl.env import CARS
-from racer_rl.observation import CURVATURE_SCALE, LOOKAHEAD
-from racer_rl.vehicle import DynamicRaceCar
+from racer_rl import (
+    TRACKS,
+    RaceCar,
+    Step,
+    Track,
+    make_env,
+    observe,
+    show_video,
+    start,
+    time_trial,
+    transition,
+)
+from racer_rl.env import CURVATURE_SCALE, DT, FRAMES, LOOKAHEAD, simulate
 
 
 def follow_centerline(obs: np.ndarray) -> np.ndarray:
@@ -25,8 +36,8 @@ def follow_centerline(obs: np.ndarray) -> np.ndarray:
 def test_track_is_closed_and_smooth(name):
     track = Track.from_name(name)
     s = np.arange(0.0, track.length + 0.1, 0.1)
-    points = np.array([track.position(x) for x in s])
-    headings = np.unwrap([track.heading(x) for x in s])
+    points = np.asarray(track.position(s))
+    headings = np.unwrap(track.heading(s))
     # No jump in position or heading anywhere, including across the finish line
     assert np.linalg.norm(np.diff(points, axis=0), axis=1).max() < 0.11
     assert np.abs(np.diff(headings)).max() < 0.1 * np.abs(track.curvatures).max() + 1e-6
@@ -38,12 +49,12 @@ def test_track_is_closed_and_smooth(name):
 def test_locate_inverts_position(name):
     track = Track.from_name(name)
     rng = np.random.default_rng(0)
-    for s in rng.uniform(0, track.length, 200):
-        lateral = rng.uniform(-1, 1) * track.half_width(s)
-        hint = int(track.segment_at(s))
-        _, s_found, lateral_found = track.locate(track.position(s, lateral), hint)
-        assert s_found == pytest.approx(s, abs=1e-6)
-        assert lateral_found == pytest.approx(lateral, abs=1e-6)
+    s = rng.uniform(0, track.length, 200)
+    lateral = rng.uniform(-1, 1, 200) * track.half_width(s)
+    points, hints = track.position(s, lateral), track.segment_at(s)
+    _, s_found, lateral_found = jax.vmap(track.locate)(points, hints)
+    np.testing.assert_allclose(s_found, s, atol=1e-6)
+    np.testing.assert_allclose(lateral_found, lateral, atol=1e-6)
 
 
 def test_laguna_seca_is_as_wide_as_its_boundaries():
@@ -55,22 +66,27 @@ def test_laguna_seca_is_as_wide_as_its_boundaries():
     # Both edges of the track are on the points of the boundary files
     entry = TRACKS["laguna_seca"]
     given = np.vstack([_load_boundary(f, entry["origin"]) for f in entry["boundaries"]])
+    s = np.arange(0.0, track.length, 25.0)
     for side in (1, -1):
-        for s in np.arange(0.0, track.length, 25.0):
-            edge = track.position(s, side * track.half_width(s))
+        for edge in np.asarray(track.position(s, side * track.half_width(s))):
             assert np.linalg.norm(given - edge, axis=1).min() < 1.0
     # A constant width can be asked for instead
     assert Track.from_name("laguna_seca", 12.0).half_width(1000.0) == 6.0
     # The car can turn tighter than the tightest corner
-    tightest_turn = (RaceCar.WHEELBASE / 2) / np.sin(np.arctan(np.tan(0.25) / 2))
+    lock = RaceCar.STEERING_LOCK
+    tightest_turn = (RaceCar.WHEELBASE / 2) / np.sin(np.arctan(np.tan(lock) / 2))
     assert tightest_turn < 1 / np.abs(track.curvatures).max()
 
 
-@pytest.mark.parametrize("dynamics", ["kinematic", "dynamic"])
-def test_env_follows_gymnasium_api(dynamics):
-    env = make_env(dynamics=dynamics)
+def test_env_follows_gymnasium_api():
+    env = make_env()
     assert env.observation_space.shape == (19,)
     check_env(env.unwrapped, skip_render_check=True)
+
+
+def test_env_refuses_an_option_it_does_not_have():
+    with pytest.raises(TypeError, match="dynamics"):
+        make_env(dynamics="kinematic")
 
 
 def test_reset_is_reproducible():
@@ -122,8 +138,7 @@ def test_steering_follows_the_command_at_a_limited_rate():
         "oval", reward=lambda step: steps.append(step) or 0.0, random_start=False
     )
     env.reset()
-    full_lock = env.unwrapped.action_type.steering_range[1]
-    per_step = RaceCar.STEERING_RATE * steps_dt(env) / full_lock  # share of full lock
+    per_step = RaceCar.STEERING_RATE * DT / RaceCar.STEERING_LOCK  # share of full lock
     assert 0 < per_step < 1
     obs, *_ = env.step(np.array([0.0, 1.0]))  # ask for full lock to the right
     assert steps[-1].steering == pytest.approx(1.0)
@@ -134,10 +149,6 @@ def test_steering_follows_the_command_at_a_limited_rate():
     for _ in range(int(2 / per_step)):
         obs, *_ = env.step(np.array([0.0, -1.0]))
     assert steps[-1].steering_actual == pytest.approx(-1.0)  # it gets there, and stops
-
-
-def steps_dt(env) -> float:
-    return 1 / env.unwrapped.config["policy_frequency"]
 
 
 def test_leaving_the_track_terminates():
@@ -153,24 +164,8 @@ def test_leaving_the_track_terminates():
     assert abs(steps[-1].lateral) > steps[-1].half_width
 
 
-def test_grip_limits_cornering():
-    env = make_env(random_start=False)
-    env.reset()
-    car = env.unwrapped.vehicle
-    car.speed = 25.0
-    for _ in range(5):
-        env.step(np.array([0.0, 1.0]))  # full steering lock, no pedal
-        assert abs(car.lateral_acceleration) <= RaceCar.GRIP + 1e-9
-    # Braking leaves less grip for turning
-    car.speed = 25.0
-    env.step(np.array([-1.0, 1.0]))
-    available = np.sqrt(RaceCar.GRIP**2 - RaceCar.MAX_BRAKING**2)
-    assert abs(car.lateral_acceleration) <= available + 1e-9
-
-
-@pytest.mark.parametrize("dynamics", ["kinematic", "dynamic"])
 @pytest.mark.parametrize("name", sorted(TRACKS))
-def test_a_simple_controller_completes_the_time_trial(name, dynamics):
+def test_a_simple_controller_completes_the_time_trial(name):
     lap_times = []
 
     def reward(step: Step) -> float:
@@ -178,9 +173,7 @@ def test_a_simple_controller_completes_the_time_trial(name, dynamics):
             lap_times.append(step.lap_time)
         return 0.0
 
-    result = time_trial(
-        follow_centerline, name, laps=2, reward=reward, dynamics=dynamics
-    )
+    result = time_trial(follow_centerline, name, laps=2, reward=reward)
     assert result.completed and not result.off_track
     assert result.laps_covered == 2
     assert result.total_time == pytest.approx(sum(result.lap_times))
@@ -188,6 +181,22 @@ def test_a_simple_controller_completes_the_time_trial(name, dynamics):
     assert result.lap_times[1] < result.lap_times[0]
     # The reward function is told about each completed lap
     assert lap_times == result.lap_times
+
+
+def test_time_trial_gives_a_planner_the_state_of_the_race():
+    track = Track.from_name("oval")
+    step = jax.jit(lambda state, action: transition(track, state, action))
+    expected = [start(track)]
+
+    def planner(obs, state):
+        np.testing.assert_allclose(state.car, expected[0].car, atol=1e-9)
+        np.testing.assert_allclose(observe(track, state), obs, atol=1e-6)
+        action = follow_centerline(obs)
+        expected[0] = step(state, action)  # where the planner expects to be next
+        return action
+
+    result = time_trial(planner, "oval", with_state=True)
+    assert result.completed
 
 
 def test_time_trial_reports_an_incomplete_run():
@@ -225,20 +234,18 @@ def test_time_trial_saves_a_video(tmp_path):
     assert show_video(result.video)._repr_html_() != first
 
 
-@pytest.mark.parametrize("dynamics", ["kinematic", "dynamic"])
-def test_time_trial_saves_the_whole_trial(tmp_path, dynamics):
+def test_time_trial_saves_the_whole_trial(tmp_path):
     result = time_trial(
         follow_centerline,
         "oval",
         laps=2,
         save_trial=str(tmp_path / "trials" / "someone"),
-        dynamics=dynamics,
     )
     assert result.saved == str(tmp_path / "trials" / "someone.npz")
     trial = np.load(result.saved)
     assert list(trial["lap_times"]) == result.lap_times
     assert trial["laps"] == 2 and trial["completed"] and not trial["off_track"]
-    assert str(trial["track"]) == "oval" and str(trial["dynamics"]) == dynamics
+    assert str(trial["track"]) == "oval" and str(trial["dynamics"]) == "dynamic"
     # From the standing start to the end of the last lap
     assert len(trial["position"]) == len(trial["actions"]) + 1
     assert trial["time"][0] == 0.0 and trial["speed"][0] == 0.0
@@ -246,12 +253,11 @@ def test_time_trial_saves_the_whole_trial(tmp_path, dynamics):
     assert sum(result.lap_times) <= duration < sum(result.lap_times) + trial["dt"]
 
     # The actions, applied to a car in the first state, give the same trial again
-    car = CARS[dynamics](None, trial["position"][0], trial["heading"][0], 0.0)
-    for action, position in zip(trial["actions"], trial["position"][1:]):
-        car.act({"acceleration": action[0], "steering": 0.25 * action[1]})
-        for _ in range(2):  # two simulation steps for each decision
-            car.step(0.05)
-        assert car.position == pytest.approx(position, abs=1e-6)
+    car = RaceCar.state(trial["position"][0], trial["heading"][0])
+    _, cars = jax.lax.scan(
+        lambda car, action: (simulate(car, action)[-1],) * 2, car, trial["actions"]
+    )
+    np.testing.assert_allclose(cars[:, :2], trial["position"][1:], atol=1e-6)
 
 
 def test_time_trial_saves_a_trial_that_leaves_the_track(tmp_path):
@@ -263,41 +269,135 @@ def test_time_trial_saves_a_trial_that_leaves_the_track(tmp_path):
     assert len(trial["lap_times"]) == 0 and len(trial["actions"]) > 0
 
 
-def cornering(car_class, speed: float, seconds: float) -> float:
+def cornering(speed: float, seconds: float, pedal: float = 0.0) -> float:
     """Cornering acceleration after holding the wheels at a small angle, at speed."""
-    car = car_class(None, np.zeros(2), heading=0.0, speed=speed)
-    car.steering_angle = 0.05  # [rad], as if the wheels were already there
-    car.act({"steering": 0.05, "acceleration": 0.0})
-    for _ in range(round(seconds / 0.05)):
-        car.step(0.05)
-        car.speed = speed
-    return car.lateral_acceleration
+    dt = DT / FRAMES
+    angle = 0.05  # [rad], as if the wheels were already there
+    action = jnp.array([pedal, angle / RaceCar.STEERING_LOCK])
+    car = RaceCar.state(jnp.zeros(2), 0.0, speed).at[6].set(angle)
+    step = jax.jit(RaceCar.step)
+    for _ in range(round(seconds / dt)):
+        car = step(car, action, dt).at[3].set(speed)
+    return float(RaceCar.lateral_acceleration(car, action))
 
 
-def test_kinematic_car_corners_at_once_and_dynamic_car_builds_up():
+def test_cornering_builds_up_to_the_grip_limit():
     grip = RaceCar.GRIP
-    # At 60 m/s this steering angle asks for more than the tyres can give
-    assert cornering(RaceCar, 60.0, 0.05) == pytest.approx(grip)
-    # In the dynamic car the front tyres bite at once, but the rear ones only push
-    # once the car has started to rotate
-    at_once = cornering(DynamicRaceCar, 60.0, 0.05)
-    settled = cornering(DynamicRaceCar, 60.0, 2.0)
+    # At 60 m/s this steering angle asks for more than the tyres can give. The front
+    # tyres bite at once, but the rear ones only push once the car has started to
+    # rotate
+    at_once = cornering(60.0, 0.05)
+    settled = cornering(60.0, 2.0)
     assert at_once < 0.6 * grip
     assert 0.7 * grip < settled < 1.1 * grip
+    # Braking leaves less grip for turning
+    assert abs(cornering(60.0, 2.0, pedal=-1.0)) < 0.5 * settled
 
 
-def test_dynamic_car_goes_straight_without_steering():
-    car = DynamicRaceCar(None, np.zeros(2), heading=0.3, speed=40.0)
-    car.act({"steering": 0.0, "acceleration": 1.0})
-    for _ in range(40):  # 2 s
-        car.step(0.05)
-    assert car.heading == pytest.approx(0.3)
-    assert car.sideslip == 0.0 and car.yaw_rate == 0.0
-    assert car.speed == pytest.approx(40.0 + 2.0 * RaceCar.MAX_ACCELERATION)
+def test_car_goes_straight_without_steering():
+    dt = DT / FRAMES
+    car = RaceCar.state(jnp.zeros(2), 0.3, 40.0)
+    step = jax.jit(RaceCar.step)
+    for _ in range(round(2.0 / dt)):
+        car = step(car, jnp.array([1.0, 0.0]), dt)
+    x, y, heading, speed, lateral_speed, yaw_rate, wheels = car
+    assert heading == pytest.approx(0.3)
+    assert lateral_speed == 0.0 and yaw_rate == 0.0 and wheels == 0.0
+    assert speed == pytest.approx(40.0 + 2.0 * RaceCar.MAX_ACCELERATION)
+    assert np.hypot(x, y) == pytest.approx(40.0 * 2.0 + RaceCar.MAX_ACCELERATION * 2.0)
 
 
-def test_dynamic_car_survives_wild_driving():
-    env = make_env(dynamics="dynamic")
+def test_transition_is_the_step_of_the_environment():
+    env = make_env("hairpins", random_start=False)
+    obs, _ = env.reset()
+    track = env.unwrapped.track
+    state = start(track)
+    step = jax.jit(lambda state, action: transition(track, state, action))
+    for _ in range(100):
+        np.testing.assert_allclose(observe(track, state), obs, atol=1e-6)
+        action = follow_centerline(obs)
+        obs, *_ = env.step(action)
+        state = step(state, action)
+        for mine, theirs in zip(state, env.unwrapped.state):
+            np.testing.assert_allclose(mine, theirs, atol=1e-9)
+
+
+def test_many_futures_are_computed_at_once():
+    track = Track.from_name("oval")
+
+    def drive(steering):
+        action = jnp.stack([jnp.ones(()), steering])
+        return jax.lax.scan(
+            lambda state, _: (transition(track, state, action), state.on_track),
+            start(track),
+            length=40,
+        )
+
+    final, on_track = jax.jit(jax.vmap(drive))(jnp.array([-0.3, 0.0, 0.3]))
+    # Four seconds of full throttle, 80 m: only the car going straight is still racing
+    assert list(final.on_track) == [False, True, False]
+    assert float(final.lateral[1]) == pytest.approx(0.0, abs=1e-9)
+    # The other two stopped where they left the track, and stayed there
+    left = int(np.argmin(on_track[0]))
+    assert 0 < left < 39 and not on_track[0, left:].any()
+    assert float(final.distance[0]) < 0.5 * float(final.distance[1])
+
+
+def test_bellmax_searches_the_race():
+    from racer_rl import bellmax
+
+    track = Track.from_name("oval")
+    choices = jnp.array([[1.0, 0.0], [1.0, 1.0], [1.0, -1.0], [-1.0, 0.0]])
+
+    class Search(bellmax.MCTS):
+        def actions(self, state):
+            return choices
+
+        def transition(self, state, action):
+            return transition(track, state, action)
+
+        def reward(self, state, action, next_state, *args):
+            covered = (next_state.distance - state.distance) / 8.0
+            return (covered - ~next_state.on_track).astype(jnp.float32)
+
+        def terminal(self, state, *args):
+            return ~state.on_track
+
+        def path(self, state, action):
+            return jax.tree.map(lambda x: x[None], self.transition(state, action))
+
+    search = Search(max_depth=20, num_sim=200)
+    key, state = jax.random.key(0), start(track, speed=30.0)
+    result = search.search(key, state)
+    assert int(result.action_visits.sum()) == search.num_sim
+    # On a straight at 30 m/s: full throttle, and no steering
+    assert int(jnp.argmax(result.action_visits)) == 0
+
+    # The pictures of that search
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from racer_rl import utils
+
+    values = utils.tree_values(search, result.tree)
+    assert len(values.positions) == len(values.q) == search.num_sim + 1
+    assert values.paths.shape == (search.num_sim + 1, 2, 2)
+    assert np.isnan(values.q[0]) and np.isfinite(values.q[1:]).all()
+    assert values.v[0] == np.nanmax(values.q[np.asarray(result.tree.children[0])])
+    snapshots = utils.search_snapshots(search, key, state, (), 50)
+    assert list(snapshots.size) == [51, 101, 151, 201]
+    scene = utils.Scene(track, first=0.0, last=200.0, box=(150.0, 2.0, 0.0))
+    fig, axes = plt.subplots(1, 2)
+    scene.draw_action_values(axes[0], values, utils.value_scale(values), state.car)
+    scene.draw_state_values(axes[1], values, utils.value_scale(values), state.car)
+    utils.draw_flow_chart(axes[0])
+    plt.close(fig)
+
+
+def test_car_survives_wild_driving():
+    env = make_env()
     env.reset(seed=0)
     rng = np.random.default_rng(0)
     for _ in range(2000):

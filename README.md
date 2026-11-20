@@ -30,4 +30,11 @@ uv run python scripts/drive.py
 
 ## Credits
 
-Built on [HighwayEnv](https://github.com/Farama-Foundation/HighwayEnv).
+Written in [JAX](https://docs.jax.dev). 
+
+## License
+
+Distributed under the [GNU General Public License v3](LICENSE).
+
+Copyright (C) 2026 Deemo Chen, except `src/racer_rl/bellmax.py`, which is
+Copyright (C) 2026 Max Muchen Sun.

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import argparse
 
-import gymnasium as gym
+import numpy as np
+import pygame
 
-import racer_rl  # noqa: F401  (registers racer-v0)
-from racer_rl import TRACKS, format_time
+from racer_rl import TRACKS, format_time, make_env
 
 
 def main() -> None:
@@ -21,26 +21,25 @@ def main() -> None:
     parser.add_argument("--camera", default="both", choices=["both", "follow", "track"])
     args = parser.parse_args()
 
-    config = {
-        "track": args.track,
-        "camera": args.camera,
-        "random_start": False,
-        "duration": float("inf"),
-        "manual_control": True,
-        "real_time_rendering": True,
-    }
-    env = gym.make("racer-v0", render_mode="human", config=config)
+    env = make_env(
+        args.track,
+        render_mode="human",
+        camera=args.camera,
+        random_start=False,
+        duration=float("inf"),
+        real_time_rendering=True,
+    )
     env.reset()
     laps = 0
-    while True:
-        # The action passed to step() is ignored: the keyboard drives the car
-        _, _, terminated, _, info = env.step(env.action_space.sample())
-        if env.unwrapped.viewer is None:  # the window was closed
-            break
+    while not env.unwrapped.closed:  # until the window is
+        keys = pygame.key.get_pressed()
+        pedal = int(keys[pygame.K_UP]) - int(keys[pygame.K_DOWN])
+        steering = int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
+        _, _, terminated, _, info = env.step(0.7 * np.array([pedal, steering]))
         if info["laps"] > laps:
             laps = info["laps"]
             print(f"lap {laps}: {format_time(info['lap_times'][-1])}")
-        if terminated:
+        if terminated and not env.unwrapped.closed:
             print("off track!")
             env.reset()
             laps = 0

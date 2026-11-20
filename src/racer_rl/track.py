@@ -1,13 +1,12 @@
-"""Closed race tracks built from HighwayEnv lane primitives.
+"""Closed race tracks: a centerline of straights and arcs, and a width.
 
-A track is a closed, tangent-continuous centerline made of straights and arcs, and a
-width, which may vary along the lap. There are two ways to describe one:
+The centerline is closed and has no kink. There are two ways to describe a track:
 
-- a closed polygon whose corners are rounded with circular arcs (fillets), and a
-  constant width: a new track takes a few vertices;
+- a closed polygon whose corners are rounded with circular arcs, and a constant width:
+  a new track takes a few vertices;
 - its two edges, as files of points. The centerline then runs midway between them.
 
-Conventions (inherited from HighwayEnv):
+Conventions:
 - world coordinates are in metres, and the y axis points *down* on screen;
 - ``s`` is the arc length along the centerline, starting at the start/finish line;
 - the lateral offset is positive on the side towards which heading increases, which
@@ -18,13 +17,12 @@ Conventions (inherited from HighwayEnv):
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
 from functools import cache
 from importlib import resources
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from highway_env.road.lane import AbstractLane, CircularLane, LineType, StraightLane
-from highway_env.road.road import RoadNetwork
 
 DEFAULT_WIDTH = 12.0
 """ Width of a track described by a polygon [m] """
@@ -76,6 +74,17 @@ TRACKS: dict[str, dict] = {
             "11": (-136, -508),
         },
     },
+    # The same lap through the pit lane: it leaves the track before Turn 11, passes
+    # the garages along the main straight, and rejoins after Turn 2.
+    "laguna_seca_pit": {
+        "boundaries": ("ls_wall_pit_inner.csv", "ls_wall_pit_outer.csv"),
+        "origin": (36.584, -121.753),
+        "start": (-257.1, -365.2),
+        "satellite": {
+            "image": "laguna_seca.jpg",
+            "bounds": (-855.7, -710.0, 785.7, 650.0),
+        },
+    },
     # A different layout, useful to test how a policy generalises to an unseen track.
     "hairpins": {
         "vertices": [
@@ -95,63 +104,100 @@ TRACKS: dict[str, dict] = {
 
 
 class Track:
-    """A closed track, with fast centerline queries. See ``TRACKS`` for the arguments."""
+    """
+    A closed track, see ``TRACKS`` for the arguments.
+
+    Its queries are JAX functions of arrays: they take one value or many, and can be
+    compiled into a larger computation.
+    """
 
     def __init__(
         self,
-        vertices: Sequence[Sequence[float]] | None = None,
-        radii: float | Sequence[float] | None = None,
+        *,
+        vertices=None,
+        radii=None,
         width: float | None = None,
         scale: float = 1.0,
         turns: dict | None = None,
         satellite: dict | None = None,
         boundaries: tuple[str, str] | None = None,
         origin: tuple[float, float] | None = None,
-        start: Sequence[float] | None = None,
+        start=None,
     ) -> None:
-        """
-        :param width: a constant width [m]. By default a polygon is ``DEFAULT_WIDTH``
-            wide, and a track given by its boundaries is as wide as they are apart.
-        """
+        if (vertices is None) == (boundaries is None):
+            raise ValueError("a track is given by its vertices or by its boundaries")
         edges = corners = None
-        self.origin = origin  # latitude and longitude of the point (0, 0), if known
         if boundaries is None:
+            # A polygon is DEFAULT_WIDTH wide, unless told otherwise
             width = DEFAULT_WIDTH if width is None else width
             vertices = scale * np.asarray(vertices, dtype=float)
             radii = scale * np.broadcast_to(np.asarray(radii, float), len(vertices))
-            self.lanes, corners = _rounded_polygon(vertices, radii, width)
+            segments, corners = _rounded_polygon(vertices, radii)
         else:
             edges = [_load_boundary(name, origin) for name in boundaries]
-            self.lanes, edges = _between(*edges, np.asarray(start, dtype=float))
-        lengths = np.array([lane.length for lane in self.lanes])
-        self.starts = np.concatenate([[0.0], np.cumsum(lengths)[:-1]])
-        self.length = float(lengths.sum())
-        self.curvatures = np.array([_curvature(lane) for lane in self.lanes])
+            segments, edges = _between(*edges, np.asarray(start, dtype=float))
+
+        # Each segment: where it starts, its heading there, its curvature, its length
+        points, headings, curvatures, lengths = np.split(
+            np.asarray(segments), [2, 3, 4], 1
+        )
+        headings, curvatures, lengths = headings[:, 0], curvatures[:, 0], lengths[:, 0]
+        self.origin = origin  # latitude and longitude of the point (0, 0), if known
+        self.segments = len(lengths)
+        ends = np.cumsum(lengths)
+        self.length = float(ends[-1])
+        self.points = jnp.asarray(points)
+        self.headings = jnp.asarray(headings)
+        self.curvatures = jnp.asarray(curvatures)
+        self.lengths = jnp.asarray(lengths)
+        self.starts = jnp.asarray(np.concatenate([[0.0], ends[:-1]]))
+        # What an arc turns around, at which signed radius and from which angle
+        radii = 1 / np.where(curvatures == 0, 1.0, curvatures)
+        self._tangents = jnp.asarray(np.stack([np.cos(headings), np.sin(headings)], 1))
+        self._normals = jnp.asarray(np.stack([-np.sin(headings), np.cos(headings)], 1))
+        self._radii = jnp.asarray(radii)
+        self._centers = self.points + self._radii[:, None] * self._normals
+        self._phases = jnp.asarray(headings - np.sign(radii) * np.pi / 2)
+        # How many segments `locate` looks at from each one: the segment behind, the
+        # segment itself, and those within 25 m ahead
+        reach = []
+        for hint in range(self.segments):
+            count, ahead = 2, 0.0
+            while ahead < 25.0 and count < self.segments:
+                ahead += lengths[(hint - 1 + count) % self.segments]
+                count += 1
+            reach.append(count)
+        self._reach = jnp.asarray(reach)
+        self._window = max(reach)
+
         # Half the width of the track, every metre along the centerline
-        self._grid = np.arange(0.0, self.length, 1.0)
+        grid = np.arange(0.0, self.length, 1.0)
         if width is not None:
-            self.half_widths = np.full(len(self._grid), width / 2)
+            half_widths = np.full(len(grid), width / 2)
         else:
-            points = np.array([self.position(s) for s in self._grid])
-            apart = [
-                _distance(points, edge, self._grid / self.length) for edge in edges
-            ]
-            self.half_widths = (apart[0] + apart[1]) / 2
-        self.min_width = 2 * float(self.half_widths.min())
+            centerline = np.asarray(self.position(grid))
+            apart = [_distance(centerline, edge, grid / self.length) for edge in edges]
+            half_widths = (apart[0] + apart[1]) / 2
+        self.half_widths = jnp.asarray(half_widths)
+        self.min_width = 2 * float(half_widths.min())
+        self._grid = jnp.asarray(np.append(grid, self.length))  # closed into a loop
+        self._widths = jnp.asarray(np.append(half_widths, half_widths[0]))
         self._bounds: tuple[np.ndarray, np.ndarray] | None = None
+
         # Aerial image, as (file name, top-left corner [m], bottom-right corner [m])
         self.satellite = None
         if satellite is not None:
             bounds = scale * np.asarray(satellite["bounds"], dtype=float)
             self.satellite = (satellite["image"], bounds[:2], bounds[2:])
         # Named corners, as (label, arc length of the corner)
-        if corners is not None:
-            self.turns = [
-                (label, float(self.starts[corners[i]] + lengths[corners[i]] / 2))
-                for i, label in (turns or {}).items()
-            ]
+        turns = turns or {}
+        if corners is None:
+            self.turns = [(label, self._apex(near)) for label, near in turns.items()]
         else:
-            self.turns = [(label, self._apex(p)) for label, p in (turns or {}).items()]
+            middles = np.asarray(self.starts) + lengths / 2
+            self.turns = [
+                (label, float(middles[corners[i]])) for i, label in turns.items()
+            ]
 
     @classmethod
     def from_name(cls, name: str, width: float | None = None) -> Track:
@@ -164,52 +210,42 @@ class Track:
             raise ValueError(f"Unknown track {name!r}. Available: {sorted(TRACKS)}")
         return _from_name(name, width)
 
-    def to_network(self) -> RoadNetwork:
-        """
-        A HighwayEnv road network. HighwayEnv wants one and looks up the lane nearest
-        to the car at every step, but nothing here uses the answer, so the network
-        holds a single segment rather than the hundreds a track can have.
-        """
-        net = RoadNetwork()
-        net.add_lane("0", "1", self.lanes[0])
-        return net
-
-    def metres(self, latitude: np.ndarray, longitude: np.ndarray) -> np.ndarray:
+    def metres(self, latitude, longitude) -> np.ndarray:
         """World positions [m] of points given by their latitude and longitude."""
         if self.origin is None:
             raise ValueError("This track is not placed on the map: it has no origin.")
         return _metres(np.asarray(latitude), np.asarray(longitude), self.origin)
 
-    def half_width(self, s: float | np.ndarray) -> float | np.ndarray:
-        """Half the width of the track [m] at the arc length(s) ``s``."""
-        return np.interp(s, self._grid, self.half_widths, period=self.length)
+    def segment_at(self, s) -> jax.Array:
+        return jnp.searchsorted(self.starts, jnp.mod(s, self.length), side="right") - 1
 
-    def _apex(self, point: Sequence[float]) -> float:
-        """Arc length of the sharpest part of the corner near a point."""
-        point = np.asarray(point, dtype=float)
-        nearest = min(
-            range(len(self.lanes)), key=lambda i: self.lanes[i].distance(point)
-        )
-        around = self.starts[nearest] + np.arange(-40.0, 41.0)
-        return float(around[np.argmax(np.abs(self.curvature(around)))] % self.length)
+    def position(self, s, lateral=0.0) -> jax.Array:
+        """World position [m], ``s`` along the centerline and ``lateral`` across it."""
+        s, lateral = jnp.broadcast_arrays(jnp.asarray(s, float), jnp.asarray(lateral))
+        i = self.segment_at(s)
+        along = jnp.mod(s, self.length) - self.starts[i]
+        heading = self.headings[i] + self.curvatures[i] * along
+        normal = jnp.stack([-jnp.sin(heading), jnp.cos(heading)], axis=-1)
+        straight = self.points[i] + along[..., None] * self._tangents[i]
+        arc = self._centers[i] - self._radii[i][..., None] * normal
+        curved = (self.curvatures[i] != 0)[..., None]
+        return jnp.where(curved, arc, straight) + lateral[..., None] * normal
 
-    def segment_at(self, s: float | np.ndarray) -> np.ndarray:
-        """Index of the segment containing the arc length(s) ``s``."""
-        return np.searchsorted(self.starts, np.mod(s, self.length), side="right") - 1
+    def heading(self, s) -> jax.Array:
+        """Direction of the centerline [rad]."""
+        i = self.segment_at(s)
+        along = jnp.mod(s, self.length) - self.starts[i]
+        return self.headings[i] + self.curvatures[i] * along
 
-    def position(self, s: float, lateral: float = 0.0) -> np.ndarray:
-        i = int(self.segment_at(s))
-        return self.lanes[i].position(s % self.length - self.starts[i], lateral)
-
-    def heading(self, s: float) -> float:
-        i = int(self.segment_at(s))
-        return self.lanes[i].heading_at(s % self.length - self.starts[i])
-
-    def curvature(self, s: float | np.ndarray) -> np.ndarray:
-        """Signed centerline curvature [1/m] at the arc length(s) ``s``."""
+    def curvature(self, s) -> jax.Array:
+        """Signed curvature of the centerline [1/m]."""
         return self.curvatures[self.segment_at(s)]
 
-    def locate(self, position: np.ndarray, hint: int) -> tuple[int, float, float]:
+    def half_width(self, s) -> jax.Array:
+        """Half the width of the track [m]."""
+        return jnp.interp(jnp.mod(s, self.length), self._grid, self._widths)
+
+    def locate(self, position, hint) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         Project a world position onto the centerline.
 
@@ -217,37 +253,65 @@ class Track:
         within 25 m ahead), so that a car cannot "teleport" to another part of the
         track by cutting across the infield.
 
-        :param position: a world position [m]
         :param hint: index of the segment the car was last on
         :return: (segment index, arc length s along the lap [m], lateral offset [m])
         """
-        n = len(self.lanes)
-        candidates = [(hint - 1) % n, hint]
-        ahead = 0.0
-        while ahead < 25.0 and len(candidates) < n:
-            candidates.append((candidates[-1] + 1) % n)
-            ahead += self.lanes[candidates[-1]].length
-        i = min(candidates, key=lambda j: self.lanes[j].distance(position))
-        local_s, lateral = self.lanes[i].local_coordinates(position)
-        s = self.starts[i] + float(np.clip(local_s, 0.0, self.lanes[i].length))
-        return i, s % self.length, float(lateral)
+        nearby = jnp.arange(self._window, dtype=jnp.int32)
+        index = (jnp.asarray(hint, dtype=jnp.int32) - 1 + nearby) % self.segments
+        along, across, distance = self._coordinates(position, index)
+        distance = jnp.where(nearby < self._reach[hint], distance, jnp.inf)
+        nearest = jnp.argmin(distance)
+        segment = index[nearest]
+        # Where two segments meet, a position may be found on either: within a
+        # nanometre of their joint, it is at the joint
+        length = self.lengths[segment]
+        along = jnp.clip(along[nearest], 0.0, length)
+        along = jnp.where(
+            along < 1e-9, 0.0, jnp.where(length - along < 1e-9, length, along)
+        )
+        return segment, (self.starts[segment] + along) % self.length, across[nearest]
 
     def bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Axis-aligned bounding box (min corner, max corner) of the track surface."""
         if self._bounds is None:
-            s = np.arange(0.0, self.length, 2.0)
-            points = np.array([self.position(si) for si in s])
-            half_width = self.half_widths.max()
-            self._bounds = (
-                points.min(axis=0) - half_width,
-                points.max(axis=0) + half_width,
-            )
+            points = np.asarray(self.position(jnp.arange(0.0, self.length, 2.0)))
+            margin = float(self.half_widths.max())
+            self._bounds = points.min(axis=0) - margin, points.max(axis=0) + margin
         return self._bounds
+
+    def _coordinates(self, position, index):
+        """Where a position is along and across some segments, and how far from each."""
+        offset = position - self.points[index]
+        on_straight = (offset * self._tangents[index]).sum(-1)
+        off_straight = (offset * self._normals[index]).sum(-1)
+        offset = position - self._centers[index]
+        radius, turn = jnp.abs(self._radii[index]), jnp.sign(self._radii[index])
+        angle = jnp.arctan2(offset[..., 1], offset[..., 0]) - self._phases[index]
+        on_arc = turn * wrap_to_pi(angle) * radius
+        off_arc = turn * (radius - jnp.linalg.norm(offset, axis=-1))
+
+        curved = self.curvatures[index] != 0
+        along = jnp.where(curved, on_arc, on_straight)
+        across = jnp.where(curved, off_arc, off_straight)
+        beyond = jnp.maximum(along - self.lengths[index], 0) + jnp.maximum(-along, 0)
+        return along, across, jnp.abs(across) + beyond
+
+    def _apex(self, point) -> float:
+        """Arc length of the sharpest part of the corner near a point."""
+        everywhere = jnp.arange(self.segments)
+        *_, distance = self._coordinates(jnp.asarray(point, dtype=float), everywhere)
+        around = self.starts[jnp.argmin(distance)] + jnp.arange(-40.0, 41.0)
+        sharpest = jnp.argmax(jnp.abs(self.curvature(around)))
+        return float(around[sharpest] % self.length)
 
 
 @cache
 def _from_name(name: str, width: float | None) -> Track:
     return Track(**TRACKS[name], width=width)
+
+
+def wrap_to_pi(angle):
+    return (angle + jnp.pi) % (2 * jnp.pi) - jnp.pi
 
 
 def _load_boundary(name: str, origin: tuple[float, float]) -> np.ndarray:
@@ -274,14 +338,14 @@ def _metres(
 
 def _between(
     inner: np.ndarray, outer: np.ndarray, start: np.ndarray
-) -> tuple[list[AbstractLane], list[np.ndarray]]:
+) -> tuple[list, list[np.ndarray]]:
     """
     The centerline midway between the two edges of a track, as a chain of arcs.
 
     :param inner: points of one edge, going around the lap
     :param outer: points of the other edge, point i facing point i of ``inner``
     :param start: the lap starts where the centerline passes closest to this point
-    :return: the lanes, and the two edges starting from the start/finish line
+    :return: the segments, and the two edges starting from the start/finish line
     """
     if np.allclose(inner[0], inner[-1]):  # closed loops: drop the repeated point
         inner, outer = inner[:-1], outer[:-1]
@@ -307,10 +371,10 @@ def _between(
     # in the direction of the middle line there, so the chain has no kink
     every = round(8.0 / spacing)  # a node every 8 m
     nodes = np.arange(0, count - every // 2, every)
-    lanes: list[AbstractLane] = []
+    segments = []
     for i, j in zip(nodes, np.roll(nodes, -1)):
-        lanes += _biarc(path[i], directions[i], path[j], directions[j])
-    return lanes, [inner, outer]
+        segments += _biarc(path[i], directions[i], path[j], directions[j])
+    return segments, [inner, outer]
 
 
 def _smooth(points: np.ndarray, sigma: float) -> np.ndarray:
@@ -326,7 +390,7 @@ def _smooth(points: np.ndarray, sigma: float) -> np.ndarray:
 
 def _biarc(
     start: np.ndarray, direction: np.ndarray, end: np.ndarray, end_direction: np.ndarray
-) -> list[AbstractLane]:
+) -> list:
     """Two arcs that leave ``start`` and reach ``end`` in the given unit directions."""
     chord = end - start
     both = direction + end_direction
@@ -345,33 +409,19 @@ def _biarc(
 
 def _arc(
     start: np.ndarray, direction: np.ndarray, end: np.ndarray
-) -> tuple[AbstractLane, np.ndarray]:
+) -> tuple[list, np.ndarray]:
     """
     The arc that leaves ``start`` in a unit direction and passes through ``end``.
 
-    :return: the lane, and the direction in which it arrives at ``end``
+    :return: the segment, and the direction in which it arrives at ``end``
     """
-    lines = (LineType.CONTINUOUS, LineType.CONTINUOUS)
     chord = end - start
     turn = 2 * math.atan2(
         direction[0] * chord[1] - direction[1] * chord[0], direction @ chord
     )
     if abs(turn) < 1e-7:
-        lane = StraightLane(start, end, width=DEFAULT_WIDTH, line_types=lines)
-        return lane, direction
+        return _straight(start, end), direction
     radius = float(np.linalg.norm(chord)) / (2 * abs(math.sin(turn / 2)))
-    sign = math.copysign(1.0, turn)
-    center = start + sign * radius * np.array([-direction[1], direction[0]])
-    phase = math.atan2(direction[1], direction[0]) - sign * math.pi / 2
-    lane = CircularLane(
-        center,
-        radius,
-        phase,
-        phase + turn,
-        clockwise=sign > 0,
-        width=DEFAULT_WIDTH,
-        line_types=lines,
-    )
     cos, sin = math.cos(turn), math.sin(turn)
     arrival = np.array(
         [
@@ -379,7 +429,21 @@ def _arc(
             sin * direction[0] + cos * direction[1],
         ]
     )
-    return lane, arrival
+    return _curve(start, direction, math.copysign(radius, turn), abs(turn)), arrival
+
+
+def _straight(start: np.ndarray, end: np.ndarray) -> list:
+    """A segment: (x, y, heading, curvature, length)."""
+    along = end - start
+    return [*start, math.atan2(along[1], along[0]), 0.0, float(np.linalg.norm(along))]
+
+
+def _curve(
+    start: np.ndarray, direction: np.ndarray, radius: float, turn: float
+) -> list:
+    """An arc that turns by ``turn`` [rad], towards positive headings if ``radius`` > 0."""
+    heading = math.atan2(direction[1], direction[0])
+    return [*start, heading, 1 / radius, abs(radius) * turn]
 
 
 def _distance(points: np.ndarray, edge: np.ndarray, lap: np.ndarray) -> np.ndarray:
@@ -401,26 +465,16 @@ def _distance(points: np.ndarray, edge: np.ndarray, lap: np.ndarray) -> np.ndarr
     return np.linalg.norm(to_points - along[..., None] * ab, axis=-1).min(axis=1)
 
 
-def _curvature(lane: AbstractLane) -> float:
-    if isinstance(lane, CircularLane):
-        return lane.direction / lane.radius
-    return 0.0
-
-
-def _rounded_polygon(
-    vertices: np.ndarray, radii: np.ndarray, width: float
-) -> tuple[list[AbstractLane], list[int]]:
+def _rounded_polygon(vertices: np.ndarray, radii: np.ndarray) -> tuple[list, list[int]]:
     """
-    Build the centerline of a closed polygon whose corners are rounded with arcs.
+    The centerline of a closed polygon whose corners are rounded with arcs.
 
     The start/finish line is the midpoint of the edge joining the last vertex to the
     first one, and the track runs through the vertices in the given order.
 
-    :return: the lanes, and the index of the lane rounding each vertex
+    :return: the segments, and the index of the segment rounding each vertex
     """
     n = len(vertices)
-    lines = (LineType.CONTINUOUS, LineType.CONTINUOUS)
-
     # For each corner: the points where the arc leaves the incoming edge (entry) and
     # joins the outgoing edge (exit), and the arc itself.
     entries, exits, arcs = [], [], []
@@ -431,26 +485,13 @@ def _rounded_polygon(
         turn = np.arctan2(d_in[0] * d_out[1] - d_in[1] * d_out[0], d_in @ d_out)
         if abs(turn) < 1e-6:
             raise ValueError(f"Vertex {i} is not a corner (edges are collinear).")
-        sign = np.sign(turn)
         tangent = radii[i] * np.tan(abs(turn) / 2)
         entry, exit_ = corner - tangent * d_in, corner + tangent * d_out
-        center = entry + sign * radii[i] * np.array([-d_in[1], d_in[0]])
-        start_phase = np.arctan2(d_in[1], d_in[0]) - sign * np.pi / 2
-        arcs.append(
-            CircularLane(
-                center,
-                radii[i],
-                start_phase,
-                start_phase + turn,
-                clockwise=bool(sign > 0),
-                width=width,
-                line_types=lines,
-            )
-        )
+        arcs.append(_curve(entry, d_in, math.copysign(radii[i], turn), abs(turn)))
         entries.append(entry)
         exits.append(exit_)
 
-    def straight(start: np.ndarray, end: np.ndarray, edge: int) -> list[AbstractLane]:
+    def straight(start: np.ndarray, end: np.ndarray, edge: int) -> list:
         direction = _unit(vertices[edge] - vertices[edge - 1])
         length = (end - start) @ direction
         if length < -1e-6:
@@ -458,23 +499,21 @@ def _rounded_polygon(
                 f"The corners at both ends of the edge leading to vertex {edge} "
                 "overlap: reduce their radii or move the vertices apart."
             )
-        if length < 1e-6:
-            return []
-        return [StraightLane(start, end, width=width, line_types=lines)]
+        return [] if length < 1e-6 else [_straight(start, end)]
 
     # Split the last-to-first edge at its midpoint to place the start/finish line.
     start_line = (exits[-1] + entries[0]) / 2
     if (entries[0] - exits[-1]) @ _unit(vertices[0] - vertices[-1]) < 1.0:
         raise ValueError("The edge holding the start/finish line needs a straight.")
-    lanes: list[AbstractLane] = straight(start_line, entries[0], 0)
+    segments = straight(start_line, entries[0], 0)
     corners = []
     for i in range(n):
         if i > 0:
-            lanes += straight(exits[i - 1], entries[i], i)
-        corners.append(len(lanes))
-        lanes.append(arcs[i])
-    lanes += straight(exits[-1], start_line, 0)
-    return lanes, corners
+            segments += straight(exits[i - 1], entries[i], i)
+        corners.append(len(segments))
+        segments.append(arcs[i])
+    segments += straight(exits[-1], start_line, 0)
+    return segments, corners
 
 
 def _unit(vector: np.ndarray) -> np.ndarray:

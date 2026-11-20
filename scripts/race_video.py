@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from itertools import pairwise
 from pathlib import Path
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")  # no window is needed
 
 import imageio_ffmpeg
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pygame
 
@@ -83,10 +86,12 @@ class Run:
         position, time = data["position"], data["time"]
 
         # How far the car has gone since the start of the trial, at each instant
-        segment = int(track.segment_at(0.0))
-        along = np.zeros(len(position))
-        for i, point in enumerate(position):
-            segment, along[i], _ = track.locate(point, segment)
+        def follow(segment, point):
+            segment, along, _ = track.locate(point, segment)
+            return segment, along
+
+        _, along = jax.lax.scan(follow, track.segment_at(0.0), jnp.asarray(position))
+        along = np.asarray(along)
         half = track.length / 2
         first = along[0] - track.length if along[0] > half else along[0]
         steps = (np.diff(along) + half) % track.length - half
@@ -208,7 +213,7 @@ class Picture:
         )
         along = np.arange(0.0, track.length + 1.0)
         self.edges = [
-            np.array([track.position(s, side * track.half_width(s)) for s in along])
+            np.asarray(track.position(along, side * track.half_width(along)))
             for side in (1, -1)
         ]
         self.icons = {
@@ -467,7 +472,10 @@ def main() -> None:
         macro_block_size=2,
         output_params=["-preset", "veryfast"],
     )
-    encoder.send(None)
+    with warnings.catch_warnings():
+        # JAX warns about any fork, including the one that starts ffmpeg
+        warnings.simplefilter("ignore", RuntimeWarning)
+        encoder.send(None)
     dt = args.speed / args.fps  # of the race, per frame
     start = -1.0  # the cars wait on the line, or come up to it, for a second
     end = max(lap.end for lap in laps) + HOLD_SECONDS * args.speed

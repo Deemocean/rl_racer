@@ -1,7 +1,4 @@
-"""A race-track renderer, replacing HighwayEnv's generic road drawing.
-
-It still draws with pygame, and subclasses HighwayEnv's ``EnvViewer`` so that the
-window, keyboard control and video recording keep working. Only the picture changes.
+"""The picture of a race, drawn with pygame.
 
 The design is monochrome and typographic: readouts sit directly on the canvas, on a
 shared grid, above and below the track. Colour is reserved for data: the trail behind
@@ -18,15 +15,28 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pygame
 import pygame.gfxdraw
-from highway_env.envs.common.graphics import EnvViewer
 
 from racer_rl.track import Track
-from racer_rl.vehicle import RaceCar
+from racer_rl.vehicle import HEADING, SPEED, WHEELS, RaceCar
 
 if TYPE_CHECKING:
     from racer_rl.env import RacingEnv
 
-# Colours, per theme. Select one with the "theme" entry of the environment config.
+# How a race is drawn: the options of ``RacingEnv`` besides those of the race itself
+VIEW = {
+    "camera": "both",  # "track": the whole track. "follow": the car. "both": the two.
+    "theme": "dark",  # or "light"
+    "satellite": True,  # draw the aerial image of the track, if it has one
+    "screen_width": 1200,  # in points
+    "screen_height": 800,
+    "pixel_ratio": 2,  # pixels per point in rendered frames and videos (a window: 1)
+    "scaling": 2.5,  # [points/m] of the "follow" camera
+    "heading_up": True,  # the "follow" camera turns with the car, which points up
+    "real_time_rendering": False,  # a window plays no faster than the race
+}
+FRAME_RATE = 20  # simulation steps per second of race
+
+# Colours, per theme
 THEMES = {
     "dark": {
         "canvas": (10, 10, 10),
@@ -127,26 +137,31 @@ class Type:
         return x
 
 
-class RaceViewer(EnvViewer):
+class RaceViewer:
     """Draws a ``RacingEnv``. Created by ``RacingEnv.render``."""
 
     def __init__(self, env: RacingEnv) -> None:
-        super().__init__(env)
-        pygame.display.set_caption("racer-rl")
-        self.theme = THEMES[env.config["theme"]]
+        self.env = env
+        view = self.view = env.view
+        self.theme = THEMES[view["theme"]]
+        self.offscreen = env.render_mode != "human"
         # Frames for images and videos are drawn with several pixels per point, to be
         # sharp. A window is drawn at one pixel per point, to fit on the screen.
-        self.pixel_ratio = int(env.config["pixel_ratio"]) if self.offscreen else 1
+        self.pixel_ratio = int(view["pixel_ratio"]) if self.offscreen else 1
         px = self.px
-        self.size = np.array(
-            [px(env.config["screen_width"]), px(env.config["screen_height"])]
-        )
+        self.size = np.array([px(view["screen_width"]), px(view["screen_height"])])
+        pygame.display.init()
+        pygame.font.init()
+        if not self.offscreen:
+            pygame.display.set_caption("racer-rl")
+            self.screen = pygame.display.set_mode(self.size.tolist())
+        self.clock = pygame.time.Clock()
         self.canvas = pygame.Surface(self.size)
         area = pygame.Rect(
             0, px(TOP_BAND), self.size[0], self.size[1] - px(TOP_BAND + BOTTOM_BAND)
         )
         # The views to draw, as (where in the window, which camera)
-        camera = env.config["camera"]
+        camera = view["camera"]
         if camera == "both":
             half = (area.w - px(GUTTER)) // 2
             left = pygame.Rect(area.x, area.y, half, area.h)
@@ -160,10 +175,25 @@ class RaceViewer(EnvViewer):
         self.value_large = Type("SemiBold", px(40))
         self._backgrounds: dict[tuple, tuple[pygame.Surface, np.ndarray]] = {}
         self._car = car_icon(self.theme)
-        self._limits: list[np.ndarray] | None = None
-        self._trail_length = int(TRAIL_SECONDS * env.config["simulation_frequency"])
-        self._trail: deque[tuple[np.ndarray, tuple]] = deque(maxlen=self._trail_length)
+        self._trail: deque[tuple[np.ndarray, tuple]] = deque(
+            maxlen=int(TRAIL_SECONDS * FRAME_RATE)
+        )
         self._last_step = -1
+        track = env.track
+        self._on_image = view["satellite"] and track.satellite is not None
+        # Both edges of the track, one point per metre
+        s = np.arange(0.0, track.length + 1.0, 1.0)
+        self._limits = [
+            np.asarray(track.position(s, side * track.half_width(s)))
+            for side in (1, -1)
+        ]
+        # What is named, just outside the track: (name, point of the edge, heading of
+        # the track there, side of the track)
+        names, at = zip(("Start", 0.0), *track.turns)
+        at = np.array(at)
+        sides = np.append(1.0, -np.sign(track.curvature(at[1:])))
+        edges = np.asarray(track.position(at, sides * track.half_width(at)))
+        self._labels = list(zip(names, edges, np.asarray(track.heading(at)), sides))
 
     def px(self, points: float) -> int:
         """A length in points, in pixels."""
@@ -174,7 +204,7 @@ class RaceViewer(EnvViewer):
         margin = self.px(MARGIN)
         return margin + index * (self.size[0] - 2 * margin) / COLUMNS
 
-    def get_image(self) -> np.ndarray:
+    def image(self) -> np.ndarray:
         """The rendered frame as an array of shape (height, width, 3)."""
         width, height = self.canvas.get_size()
         pixels = pygame.image.tobytes(self.canvas, "RGB")
@@ -197,13 +227,12 @@ class RaceViewer(EnvViewer):
                 self.center + reach / self.scale,
             )
         else:
-            car = self.env.vehicle
-            self.scale = float(self.env.config["scaling"]) * self.pixel_ratio
-            self.center = car.position
-            if self.env.config["heading_up"]:
+            self.scale = float(self.view["scaling"]) * self.pixel_ratio
+            self.center = self.env.car[:HEADING]
+            if self.view["heading_up"]:
                 # Turn the world so that the car points up, and keep enough of it to
                 # fill the view whichever way it is turned
-                self.rotation = -np.pi / 2 - car.heading
+                self.rotation = -np.pi / 2 - self.env.car[HEADING]
                 reach = np.full(2, np.hypot(*viewport.size) / 2)
             self.visible = low - reach / self.scale, high + reach / self.scale
 
@@ -234,7 +263,6 @@ class RaceViewer(EnvViewer):
     # -- drawing --------------------------------------------------------------------
 
     def display(self) -> None:
-        env = self.env
         self._update_trail()
 
         surface = self.canvas
@@ -252,9 +280,14 @@ class RaceViewer(EnvViewer):
 
         if not self.offscreen:
             self.screen.blit(surface, (0, 0))
-            if env.config["real_time_rendering"]:
-                self.clock.tick(env.config["simulation_frequency"])
+            if self.view["real_time_rendering"]:
+                self.clock.tick(FRAME_RATE)
             pygame.display.flip()
+            if any(event.type == pygame.QUIT for event in pygame.event.get()):
+                self.env.close()
+
+    def close(self) -> None:
+        pygame.quit()
 
     def _track_surface(self, lines: bool = True) -> tuple[pygame.Surface, np.ndarray]:
         """
@@ -263,14 +296,13 @@ class RaceViewer(EnvViewer):
 
         :param lines: include the track limits and the start line
         """
-        config = self.env.config
-        key = (config["track"], config["track_width"], self.scale, lines)
+        key = (self.scale, lines)
         if key not in self._backgrounds:
             self._backgrounds[key] = draw_track(
                 self.env.track,
                 self.scale,
                 self.theme,
-                config["satellite"],
+                self.view["satellite"],
                 self.visible,
                 self.pixel_ratio,
                 lines,
@@ -279,15 +311,7 @@ class RaceViewer(EnvViewer):
 
     def _draw_limits(self, surface: pygame.Surface) -> None:
         """The track limits and the start line, drawn as lines in the current view."""
-        track = self.env.track
-        if self._limits is None:  # both edges of the track, one point per metre
-            s = np.arange(0.0, track.length + 1.0, 1.0)
-            self._limits = [
-                np.array([track.position(x, side * track.half_width(x)) for x in s])
-                for side in (1, -1)
-            ]
-        on_image = self.env.config["satellite"] and track.satellite is not None
-        color = self.theme["text" if on_image else "edge"]
+        color = self.theme["text" if self._on_image else "edge"]
         width = max(self.px(1), round(0.25 * self.scale))
         reach = np.hypot(*self.viewport.size) / 2 / self.scale + 5.0  # [m]
         for edge in self._limits:
@@ -304,14 +328,10 @@ class RaceViewer(EnvViewer):
 
     def _draw_labels(self, surface: pygame.Surface) -> None:
         """Name the start line and the corners, just outside the track."""
-        track = self.env.track
-        on_image = self.env.config["satellite"] and track.satellite is not None
-        color = self.theme["text" if on_image else "text_secondary"]
-        labels = [("Start", 0.0, 1.0)]
-        labels += [(name, s, -np.sign(track.curvature(s))) for name, s in track.turns]
-        for name, s, side in labels:
-            edge = self._to_pixels(track.position(s, side * track.half_width(s)))
-            heading = track.heading(s) + self.rotation  # on screen
+        color = self.theme["text" if self._on_image else "text_secondary"]
+        for name, edge, heading, side in self._labels:
+            edge = self._to_pixels(edge)
+            heading = heading + self.rotation  # on screen
             outward = side * np.array([-np.sin(heading), np.cos(heading)])
             # Far enough for the text box to clear the edge of the track
             half_size = np.array([self.label.width(name), self.px(10)]) / 2
@@ -323,9 +343,8 @@ class RaceViewer(EnvViewer):
         if env.steps < self._last_step:  # the environment was reset
             self._trail.clear()
         if env.steps != self._last_step:
-            car = env.vehicle
-            color = speed_color(car.speed / car.MAX_SPEED)
-            self._trail.append((car.position.copy(), color))
+            color = speed_color(env.car[SPEED] / RaceCar.MAX_SPEED)
+            self._trail.append((env.car[:HEADING].copy(), color))
         self._last_step = env.steps
 
     def _draw_trail(self, surface: pygame.Surface) -> None:
@@ -338,20 +357,20 @@ class RaceViewer(EnvViewer):
             pygame.draw.line(surface, color, points[i], points[i + 1], width)
 
     def _draw_car(self, surface: pygame.Surface) -> None:
-        car = self.env.vehicle
+        position, heading = self.env.car[:HEADING], self.env.car[HEADING]
         # Drawn to scale, or larger when that would make it too small to see, but
         # never wider than most of the track
-        scale = max(self.scale, self.px(MIN_CAR_LENGTH) / car.LENGTH)
-        scale = min(scale, 0.7 * self.env.track.min_width / car.WIDTH * self.scale)
+        scale = max(self.scale, self.px(MIN_CAR_LENGTH) / RaceCar.LENGTH)
+        scale = min(scale, 0.7 * self.env.track.min_width / RaceCar.WIDTH * self.scale)
         # The icon points right; headings turn clockwise on screen, rotozoom the other way
         icon = pygame.transform.rotozoom(
-            self._car, -np.degrees(car.heading + self.rotation), scale / SPRITE_SCALE
+            self._car, -np.degrees(heading + self.rotation), scale / SPRITE_SCALE
         )
-        surface.blit(icon, icon.get_rect(center=self._to_pixels(car.position).round()))
+        surface.blit(icon, icon.get_rect(center=self._to_pixels(position).round()))
 
     def _draw_timing(self, surface: pygame.Surface) -> None:
         """Lap timer, lap times and speed, above the track."""
-        env, car, theme = self.env, self.env.vehicle, self.theme
+        env, theme = self.env, self.theme
         lap_times = env.lap_times
         px = self.px
         label_baseline, value_baseline = px(36), px(82)
@@ -386,7 +405,7 @@ class RaceViewer(EnvViewer):
         self.label.draw(surface, "Speed", theme["text_secondary"], x, label_baseline)
         end = self.value_large.draw(
             surface,
-            f"{car.speed:4.1f}".replace(" ", "0"),
+            f"{env.car[SPEED]:4.1f}".replace(" ", "0"),
             theme["text"],
             x,
             value_baseline,
@@ -397,7 +416,8 @@ class RaceViewer(EnvViewer):
 
     def _draw_controls(self, surface: pygame.Surface) -> None:
         """Grip use, pedals and steering, and the speed scale, below the track."""
-        env, car, theme = self.env, self.env.vehicle, self.theme
+        env, car, theme = self.env, RaceCar, self.theme
+        pedal, _ = env.command
         px = self.px
         top = self.size[1] - px(BOTTOM_BAND)
         label_baseline = top + px(26)
@@ -416,7 +436,8 @@ class RaceViewer(EnvViewer):
         pygame.draw.line(
             surface, theme["rule"], (cx, cy - hair), (cx, cy + hair), px(1)
         )
-        acceleration = np.array([car.lateral_acceleration, -car.action["acceleration"]])
+        forwards = pedal * (car.MAX_ACCELERATION if pedal >= 0 else car.MAX_BRAKING)
+        acceleration = np.array([env.lateral_acceleration, -forwards])
         dot = np.round(np.array([cx, cy]) + acceleration / car.GRIP * radius).astype(
             int
         )
@@ -439,9 +460,7 @@ class RaceViewer(EnvViewer):
         )
 
         # Pedals and steering: one label lane, one bar lane and one value lane
-        pedal = car.action["acceleration"]
-        pedal /= car.MAX_ACCELERATION if pedal >= 0 else car.MAX_BRAKING
-        steering = car.steering_angle / env.action_type.steering_range[1]
+        steering = env.car[WHEELS] / car.STEERING_LOCK
         side = "" if abs(steering) < 0.005 else " right" if steering > 0 else " left"
         rows = [
             ("Throttle", max(pedal, 0.0), f"{100 * max(pedal, 0):.0f}%"),
@@ -535,8 +554,8 @@ def draw_track(
         """Fill the track, and a margin [m] beyond each of its edges."""
         s = np.arange(0.0, track.length + 0.5, 0.5)
         reach = track.half_width(s) + margin
-        left = to_pixels([track.position(x, y) for x, y in zip(s, reach)])
-        right = to_pixels([track.position(x, -y) for x, y in zip(s, reach)])
+        left = to_pixels(track.position(s, reach))
+        right = to_pixels(track.position(s, -reach))
         for i in range(len(s) - 1):
             pygame.draw.polygon(
                 surface, color, [left[i], left[i + 1], right[i + 1], right[i]]
@@ -549,17 +568,15 @@ def draw_track(
     ribbon(0.0, (*theme["track"], 96) if satellite else theme["track"])
 
     if lines and not satellite:  # dashed centerline
-        for start in np.arange(0.0, track.length - 3.0, 9.0):
-            dash = to_pixels([track.position(x) for x in start + np.linspace(0, 3, 4)])
+        starts = np.arange(0.0, track.length - 3.0, 9.0)
+        for dash in to_pixels(track.position(starts[:, None] + np.linspace(0, 3, 4))):
             pygame.draw.lines(
                 surface, theme["centerline"], False, dash, max(1, round(0.25 * zoom))
             )
 
     if lines:  # start/finish line
-        half_width = track.half_width(0.0)
-        line = to_pixels(
-            [track.position(0.0, half_width), track.position(0.0, -half_width)]
-        )
+        half_width = float(track.half_width(0.0))
+        line = to_pixels(track.position(0.0, np.array([half_width, -half_width])))
         pygame.draw.line(
             surface,
             theme["text"],
@@ -615,10 +632,36 @@ def satellite_image(
     return pygame.transform.smoothscale(image, tuple(size)), low
 
 
+COCKPIT = (-0.1, 0.9, 0.44)  # of the car icon: its middle, length and width [m]
+
+
+def car_parts() -> list[list[tuple[float, float]]]:
+    """The race car seen from above, as polygons [m]. It points right, about (0, 0)."""
+
+    def box(x0: float, x1: float, y0: float, y1: float) -> list:
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+    half_body = [(-2.2, 0.32), (-1.2, 0.42), (-1.05, 0.62), (0.2, 0.62), (0.55, 0.3)]
+    half_body += [(1.8, 0.13), (2.3, 0.1)]
+    body = half_body + [(x, -y) for x, y in reversed(half_body)]
+    tyre = 0.42  # [m] tyre width
+    return [
+        body,
+        box(-2.5, -2.2, -0.85, 0.85),  # rear wing
+        box(2.2, 2.5, -0.95, 0.95),  # front wing
+        box(-1.6, -1.45, -0.7, 0.7),  # rear axle
+        box(1.28, 1.42, -0.7, 0.7),  # front axle
+        box(-2.0, -1.05, -1.0, -1.0 + tyre),  # rear wheels
+        box(-2.0, -1.05, 1.0 - tyre, 1.0),
+        box(0.95, 1.75, -1.0, -1.0 + tyre),  # front wheels
+        box(0.95, 1.75, 1.0 - tyre, 1.0),
+    ]
+
+
 def car_icon(theme: dict) -> pygame.Surface:
     """
-    A race car seen from above, pointing right: one flat colour, with a thin outline
-    in the canvas colour to keep it readable over the trail and the aerial image.
+    The race car as a picture: one flat colour, with a thin outline in the canvas
+    colour to keep it readable over the trail and the aerial image.
     """
     length, width = RaceCar.LENGTH, RaceCar.WIDTH
     margin = 0.2  # [m] around the car, for the outline
@@ -632,31 +675,15 @@ def car_icon(theme: dict) -> pygame.Surface:
             SPRITE_SCALE
         )
 
-    def box(x0: float, x1: float, y0: float, y1: float) -> list:
-        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-
-    half_body = [(-2.2, 0.32), (-1.2, 0.42), (-1.05, 0.62), (0.2, 0.62), (0.55, 0.3)]
-    half_body += [(1.8, 0.13), (2.3, 0.1)]
-    body = half_body + [(x, -y) for x, y in reversed(half_body)]
-    tyre = 0.42  # [m] tyre width
-    parts = [
-        body,
-        box(-2.5, -2.2, -0.85, 0.85),  # rear wing
-        box(2.2, 2.5, -0.95, 0.95),  # front wing
-        box(-1.6, -1.45, -0.7, 0.7),  # rear axle
-        box(1.28, 1.42, -0.7, 0.7),  # front axle
-        box(-2.0, -1.05, -1.0, -1.0 + tyre),  # rear wheels
-        box(-2.0, -1.05, 1.0 - tyre, 1.0),
-        box(0.95, 1.75, -1.0, -1.0 + tyre),  # front wheels
-        box(0.95, 1.75, 1.0 - tyre, 1.0),
-    ]
+    parts = car_parts()
     outline = round(0.12 * SPRITE_SCALE)
     for part in parts:  # the outline: every part again, thicker, underneath
         pygame.draw.polygon(surface, theme["canvas"], to_pixels(part))
         pygame.draw.polygon(surface, theme["canvas"], to_pixels(part), 2 * outline)
     for part in parts:
         pygame.draw.polygon(surface, theme["text"], to_pixels(part))
-    cockpit = pygame.Rect(0, 0, 0.9 * SPRITE_SCALE, 0.44 * SPRITE_SCALE)
-    cockpit.center = to_pixels((-0.1, 0.0))
+    middle, long, wide = COCKPIT
+    cockpit = pygame.Rect(0, 0, long * SPRITE_SCALE, wide * SPRITE_SCALE)
+    cockpit.center = to_pixels((middle, 0.0))
     pygame.draw.ellipse(surface, theme["canvas"], cockpit)
     return surface

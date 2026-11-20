@@ -1,16 +1,23 @@
 [project]
 name = "racer-rl"
 version = "0.1.0"
-description = "An RL assignment: train a policy to race a car around a track, built on HighwayEnv"
+description = "An RL assignment: train a policy to race a car around a track, written in JAX"
 readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [
     { name = "Deemo Chen", email = "deemo@caltech.edu" }
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "highway-env==1.12.1",
+    "gymnasium>=1.4.0",
     "imageio-ffmpeg>=0.8.1",
     "ipykernel>=7.4.0",
+    "jax>=0.12.1",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "pillow>=11.3.0",
+    "pygame-ce>=2.5.8",
     "stable-baselines3>=2.9",
     "tensorboard>=2.21.0",
 ]
@@ -26,4 +33,6 @@ dev = [
 ]
 
 [tool.ruff]
-extend-exclude = ["*.ipynb"]  # notebooks import things for students to use later
+# Notebooks import things for students to use later, and bellmax.py is kept as its
+# author wrote it
+extend-exclude = ["*.ipynb", "src/racer_rl/bellmax.py"]
